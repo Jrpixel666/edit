@@ -1,6 +1,12 @@
 package dev.apkforge.core
 import android.content.Context
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
+import java.io.BufferedInputStream
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.Paths
 
 /** Runs commands inside a bundled proot + Debian arm64 rootfs. No Termux needed. */
 class Shell(private val ctx: Context) {
@@ -43,13 +49,47 @@ class Shell(private val ctx: Context) {
   /** One-time: unpack Debian rootfs (downloaded or sideloaded tarball) and install the Android toolchain. */
   fun bootstrap(tarball: File, log: (String) -> Unit) {
     rootfs.mkdirs(); File(ctx.filesDir, "projects").mkdirs()
-    val pb = ProcessBuilder(proot.path, "--link2symlink", "-0", "/system/bin/tar", "-xJf", tarball.path, "-C", rootfs.path)
-      .withProotEnv()
-    pb.redirectErrorStream(true)
-    pb.start().apply { inputStream.bufferedReader().forEachLine(log); waitFor() }
+    log("extracting rootfs…")
+    extractTarXz(tarball, rootfs)
+    File(rootfs, "etc").mkdirs()
     File(rootfs, "etc/resolv.conf").writeText("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
     run("""apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       openjdk-17-jdk-headless apktool aapt aapt2 zipalign apksigner dexdump smali jadx \
       android-sdk-platform-23 git zip unzip python3 nano ripgrep && apt-get clean""", onLine = log)
+  }
+
+  /**
+   * Android's /system/bin/tar has no xz support (no bundled "xz" binary to shell out to), so
+   * "tar -xJf" silently fails on every device ("tar: exec xz: No such file or directory").
+   * Extract in pure Kotlin instead — no proot or system tar involved.
+   */
+  private fun extractTarXz(tarball: File, dest: File) {
+    val execMask = 0b001_001_001 // any of owner/group/other execute bits
+    XZCompressorInputStream(BufferedInputStream(tarball.inputStream())).use { xz ->
+      TarArchiveInputStream(xz).use { tar ->
+        generateSequence { tar.nextEntry as? org.apache.commons.compress.archivers.tar.TarArchiveEntry }.forEach { entry ->
+          // proot-distro's rootfs tarballs wrap everything in one top-level directory
+          // (e.g. "debian-bookworm-aarch64/etc/..."), so strip it; the entry for that directory
+          // itself strips to "" and is skipped (dest already exists as rootfs).
+          val relPath = entry.name.substringAfter('/', "")
+          if (relPath.isEmpty()) return@forEach
+          val out = File(dest, relPath)
+          runCatching {
+            when {
+              entry.isDirectory -> out.mkdirs()
+              entry.isSymbolicLink -> {
+                out.parentFile?.mkdirs()
+                out.toPath().let { p -> if (!Files.isSymbolicLink(p)) Files.createSymbolicLink(p, Paths.get(entry.linkName)) }
+              }
+              else -> { // regular files; device nodes/fifos aren't present in proot-distro's rootfs images
+                out.parentFile?.mkdirs()
+                FileOutputStream(out).use { o -> tar.copyTo(o) }
+                if (entry.mode and execMask != 0) out.setExecutable(true, false)
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }

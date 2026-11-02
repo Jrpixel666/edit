@@ -27,8 +27,13 @@ class MainActivity : ComponentActivity() {
   lateinit var ws: Workspace
   // SupervisorJob: one failed background op (a bad download, a broken import, a crashed chat
   // turn) must not cancel this shared scope's Job and silently kill every later io.launch{} —
-  // including the Chat tab's Send button — for the rest of the app's lifetime.
-  private val io = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+  // including the Chat tab's Send button — for the rest of the app's lifetime. The exception
+  // handler is a catch-all backstop: an uncaught exception from launch{} still reaches the
+  // thread's default handler (and crashes the app) even under a SupervisorJob, so any io.launch{}
+  // body that isn't individually wrapped in runCatching is a crash waiting to happen without this.
+  private val io = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, e ->
+    runOnUiThread { log += "✘ background error: ${e.message ?: e.javaClass.simpleName}" }
+  })
   override fun onCreate(s: Bundle?) {
     super.onCreate(s); ws = Workspace(this, Shell(this))
     androidx.core.content.ContextCompat.registerReceiver(this, Installer.receiver { log += it },
@@ -51,9 +56,11 @@ class MainActivity : ComponentActivity() {
     }.onSuccess { current = it }.onFailure { log += "✘ ${it.message}" }
   }
   private fun install(apk: File) = io.launch {
-    val splits = apk.parentFile!!.let { File(it, "splits").listFiles()?.sortedBy { f -> f.name } ?: emptyList() }
-    log += "installing base" + if (splits.isNotEmpty()) " + ${splits.size} splits" else ""
-    runCatching { Installer.install(this@MainActivity, apk, splits) }.onFailure { log += "✘ ${it.message}" }
+    runCatching {
+      val splits = apk.parentFile?.let { File(it, "splits").listFiles()?.sortedBy { f -> f.name } ?: emptyList() } ?: emptyList()
+      log += "installing base" + if (splits.isNotEmpty()) " + ${splits.size} splits" else ""
+      Installer.install(this@MainActivity, apk, splits)
+    }.onFailure { log += "✘ ${it.message}" }
   }
 
   @Composable fun App() {
@@ -168,7 +175,11 @@ class MainActivity : ComponentActivity() {
     items(lines.reversed()) { Text(it, fontFamily = FontFamily.Monospace, fontSize = 11.sp) } }
 
   companion object {
-    // proot-distro's Debian arm64 rootfs; swap for any arm64 Debian/Ubuntu tarball
-    const val ROOTFS_URL = "https://github.com/termux/proot-distro/releases/download/v4.18.0/debian-bookworm-aarch64-pd-v4.18.0.tar.xz"
+    // proot-distro's Debian arm64 rootfs. The original URL here (tag v4.18.0, filename
+    // "...-pd-v4.18.0.tar.xz") 404s: proot-distro's own v4.18.0 distro plugin actually points at
+    // the v4.17.3 tarball (releases don't republish the rootfs snapshot on every tool-only
+    // update), and proot-distro has since moved off static tarball releases entirely in favor of
+    // pulling OCI/Docker images, so this specific historical asset is what's actually fetchable.
+    const val ROOTFS_URL = "https://github.com/termux/proot-distro/releases/download/v4.17.3/debian-bookworm-aarch64-pd-v4.17.3.tar.xz"
   }
 }

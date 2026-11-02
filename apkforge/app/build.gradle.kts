@@ -29,4 +29,8 @@ dependencies {
   implementation("com.android.tools.smali:smali-baksmali:3.0.8")
   implementation("com.android.tools.build:apksig:8.7.2")
   implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
+  // rootfs.tar.xz extraction: Android's /system/bin/tar has no xz support (no bundled xz binary),
+  // so the Debian rootfs is unpacked in pure Kotlin instead of shelling out to it.
+  implementation("org.apache.commons:commons-compress:1.27.1")
+  implementation("org.tukaani:xz:1.10")
 }
