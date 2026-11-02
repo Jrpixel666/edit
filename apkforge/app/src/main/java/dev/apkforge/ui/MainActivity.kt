@@ -25,7 +25,10 @@ import java.io.File
 
 class MainActivity : ComponentActivity() {
   lateinit var ws: Workspace
-  private val io = CoroutineScope(Dispatchers.IO)
+  // SupervisorJob: one failed background op (a bad download, a broken import, a crashed chat
+  // turn) must not cancel this shared scope's Job and silently kill every later io.launch{} —
+  // including the Chat tab's Send button — for the rest of the app's lifetime.
+  private val io = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   override fun onCreate(s: Bundle?) {
     super.onCreate(s); ws = Workspace(this, Shell(this))
     androidx.core.content.ContextCompat.registerReceiver(this, Installer.receiver { log += it },
@@ -41,9 +44,11 @@ class MainActivity : ComponentActivity() {
     importUri(uri)
   }
   private fun importUri(uri: Uri) = io.launch {
-    val name = contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
-      ?.use { c -> if (c.moveToFirst()) c.getString(0) else null } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "app.apk"
-    current = ws.import(name, contentResolver.openInputStream(uri)!!) { log += it }
+    runCatching {
+      val name = contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
+        ?.use { c -> if (c.moveToFirst()) c.getString(0) else null } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "app.apk"
+      ws.import(name, contentResolver.openInputStream(uri)!!) { log += it }
+    }.onSuccess { current = it }.onFailure { log += "✘ ${it.message}" }
   }
   private fun install(apk: File) = io.launch {
     val splits = apk.parentFile!!.let { File(it, "splits").listFiles()?.sortedBy { f -> f.name } ?: emptyList() }
@@ -104,9 +109,15 @@ class MainActivity : ComponentActivity() {
         Card(Modifier.fillMaxWidth().padding(4.dp)) { Text("$r\n$t", Modifier.padding(8.dp), fontSize = 13.sp,
           fontFamily = if (r == "tool") FontFamily.Monospace else FontFamily.Default) } } }
       Row { OutlinedTextField(input, { input = it }, Modifier.weight(1f), placeholder = { Text("e.g. make the dock hold 6 icons") })
-        Button({ val proj = current ?: return@Button; val msg = input; input = ""; busy = true; chat += "you" to msg
-          io.launch { Agent(ws, proj) { role, t -> runOnUiThread {
-              if (role == "stream") chat[chat.lastIndex] = "assistant" to t else chat += role to t } }.send(msg); busy = false }
+        Button({ val proj = current
+          if (proj == null) { chat += "tool" to "✘ select a project in the Projects tab first"; return@Button }
+          val msg = input; input = ""; busy = true; chat += "you" to msg
+          io.launch {
+            runCatching { Agent(ws, proj) { role, t -> runOnUiThread {
+                if (role == "stream") chat[chat.lastIndex] = "assistant" to t else chat += role to t } }.send(msg) }
+              .onFailure { e -> runOnUiThread { chat += "tool" to "✘ ${e.message}" } }
+            runOnUiThread { busy = false }
+          }
         }, enabled = !busy && LlmEngine.loaded != null) { Text(if (busy) "…" else "Send") } }
     }
   }
@@ -120,32 +131,36 @@ class MainActivity : ComponentActivity() {
       item { Text("On device", style = MaterialTheme.typography.titleMedium) }
       items(dir.listFiles { f -> f.extension == "gguf" }?.toList() ?: emptyList()) { f ->
         Text("${if (LlmEngine.loaded == f.path) "● " else "○ "}${f.name}  (${f.length() shr 20} MB)",
-          Modifier.fillMaxWidth().clickable { status = "loading…"; io.launch { status = if (LlmEngine.load(f.path)) "loaded ${f.name}" else "load failed" } }.padding(8.dp)) }
+          Modifier.fillMaxWidth().clickable { status = "loading…"
+            io.launch { status = runCatching { LlmEngine.load(f.path) }.getOrElse { false }.let { if (it) "loaded ${f.name}" else "load failed" } } }.padding(8.dp)) }
       item { Text(status); HorizontalDivider()
         Row { OutlinedTextField(q, { q = it }, Modifier.weight(1f), label = { Text("Search Hugging Face") })
           Button({ io.launch { res = runCatching { HuggingFace.search(q) }.getOrDefault(emptyList()); files = emptyList() } }) { Text("Go") } } }
       if (files.isEmpty()) items(res) { m -> Text("${m.id}  ⬇${m.downloads}", Modifier.fillMaxWidth().clickable { sel = m.id
-          io.launch { files = HuggingFace.files(m.id) } }.padding(8.dp)) }
+          io.launch { files = runCatching { HuggingFace.files(m.id) }.getOrDefault(emptyList()) } }.padding(8.dp)) }
       else { item { Text(sel, style = MaterialTheme.typography.titleSmall); if (prog > 0) LinearProgressIndicator({ prog }, Modifier.fillMaxWidth()) }
         items(files) { f -> Text("${f.name}  ${f.size shr 20} MB", Modifier.fillMaxWidth().clickable {
-          io.launch { HuggingFace.download(sel, f, dir) { prog = it }; prog = 0f; status = "downloaded ${f.name}" } }.padding(8.dp)) } }
+          io.launch { runCatching { HuggingFace.download(sel, f, dir) { prog = it } }
+            .onSuccess { status = "downloaded ${f.name}" }.onFailure { status = "✘ ${it.message}" }
+            prog = 0f } }.padding(8.dp)) } }
     }
   }
 
   @Composable fun Terminal() {
     val out = remember { mutableStateListOf<String>() }; var cmd by remember { mutableStateOf("") }
     val pickRootfs = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> u ?: return@rememberLauncherForActivityResult
-      io.launch { val t = File(cacheDir, "rootfs.tar.xz"); contentResolver.openInputStream(u)!!.use { i -> t.outputStream().use { i.copyTo(it) } }
-        ws.shell.bootstrap(t) { out += it } } }
+      io.launch { runCatching { val t = File(cacheDir, "rootfs.tar.xz"); contentResolver.openInputStream(u)!!.use { i -> t.outputStream().use { i.copyTo(it) } }
+        ws.shell.bootstrap(t) { out += it } }.onFailure { out += "✘ ${it.message}" } } }
     Column(Modifier.padding(8.dp)) {
-      if (!ws.shell.ready) Row { Button({ io.launch {
+      if (!ws.shell.ready) Row { Button({ io.launch { runCatching {
           val t = File(cacheDir, "rootfs.tar.xz"); out += "downloading Debian rootfs…"
           okhttp3.OkHttpClient().newCall(okhttp3.Request.Builder().url(ROOTFS_URL).build()).execute().use { r -> t.outputStream().use { r.body!!.byteStream().copyTo(it) } }
-          ws.shell.bootstrap(t) { out += it } } }) { Text("Install toolchain") }
+          ws.shell.bootstrap(t) { out += it } }.onFailure { out += "✘ ${it.message}" } } }) { Text("Install toolchain") }
         Spacer(Modifier.width(8.dp)); OutlinedButton({ pickRootfs.launch(arrayOf("*/*")) }) { Text("From file (offline)") } }
       LogView(out, Modifier.weight(1f))
       Row { OutlinedTextField(cmd, { cmd = it }, Modifier.weight(1f), textStyle = TextStyle(fontFamily = FontFamily.Monospace))
-        Button({ val c = cmd; cmd = ""; out += "$ $c"; io.launch { ws.shell.run(c, current) { out += it } } }) { Text("Run") } }
+        Button({ val c = cmd; cmd = ""; out += "$ $c"
+          io.launch { runCatching { ws.shell.run(c, current) { out += it } }.onFailure { out += "✘ ${it.message}" } } }) { Text("Run") } }
     }
   }
 
