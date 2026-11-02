@@ -16,7 +16,7 @@ class Workspace(private val ctx: Context, val shell: Shell) {
 
   /**
    * Accepts .apk, or split bundles (.apks / .xapk / .apkm / zip of APKs).
-   * Split layout: original.apk = base (decoded + editable), splits/*.apk = config splits (kept, re-signed on build).
+   * Split layout: original.apk = base (decoded + editable), splits/ *.apk = config splits (kept, re-signed on build).
    */
   fun import(name: String, input: java.io.InputStream, log: (String) -> Unit): File {
     val dir = File(root, name.substringBeforeLast('.')).apply { deleteRecursively(); mkdirs() }

@@ -3,6 +3,7 @@ local.properties
 build/
 app/build/
 app/.cxx/
+.kotlin/
 .idea/
 *.iml
 app/src/main/cpp/llama.cpp/
